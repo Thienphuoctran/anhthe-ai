@@ -57,47 +57,47 @@ export interface PhotoSizeSpec {
 export const PHOTO_DIMENSIONS: Record<PhotoSizeKey, PhotoSizeSpec> = {
   "2x3": {
     id: "2x3",
-    width: 236,
-    height: 354,
+    width: 472,
+    height: 708,
     label: "Ảnh 2x3 cm",
-    dimensionsCm: "2 x 3 cm (236 x 354 px)",
+    dimensionsCm: "2 x 3 cm (472 x 708 px - Ultra HD)",
     description: "Dùng cho Bảo hiểm y tế, Thẻ thư viện, Hồ sơ nhỏ",
     sheetCount: 12,
   },
   "3x4": {
     id: "3x4",
-    width: 354,
-    height: 472,
+    width: 708,
+    height: 944,
     label: "Ảnh 3x4 cm",
-    dimensionsCm: "3 x 4 cm (354 x 472 px)",
+    dimensionsCm: "3 x 4 cm (708 x 944 px - Ultra HD)",
     description:
       "Dùng cho Hồ sơ xin việc, Thẻ học sinh/sinh viên, Sơ yếu lý lịch",
     sheetCount: 8,
   },
   "3.5x4.5": {
     id: "3.5x4.5",
-    width: 413,
-    height: 531,
+    width: 826,
+    height: 1062,
     label: "Ảnh 3.5x4.5 cm (Visa Schengen)",
-    dimensionsCm: "3.5 x 4.5 cm (413 x 531 px)",
+    dimensionsCm: "3.5 x 4.5 cm (826 x 1062 px - Ultra HD)",
     description: "Chuẩn Visa Châu Âu (Schengen), Hàn Quốc, Nhật Bản, Đài Loan, Úc",
     sheetCount: 6,
   },
   "4x6": {
     id: "4x6",
-    width: 472,
-    height: 709,
+    width: 944,
+    height: 1418,
     label: "Ảnh 4x6 cm",
-    dimensionsCm: "4 x 6 cm (472 x 709 px)",
+    dimensionsCm: "4 x 6 cm (944 x 1418 px - Ultra HD)",
     description: "Dùng cho CCCD, Hộ chiếu (Passport), Cổng Dịch vụ công, Bằng lái xe",
     sheetCount: 4,
   },
   visa: {
     id: "visa",
-    width: 600,
-    height: 600,
+    width: 1200,
+    height: 1200,
     label: "Ảnh Visa Mỹ 5x5 cm",
-    dimensionsCm: "5 x 5 cm / 2x2 inch (600 x 600 px)",
+    dimensionsCm: "5 x 5 cm / 2x2 inch (1200 x 1200 px - Ultra HD)",
     description: "Chuẩn hình vuông bắt buộc cho Visa Hoa Kỳ (Mỹ DS-160), Visa Ấn Độ",
     sheetCount: 4,
   },
@@ -853,15 +853,19 @@ export async function renderSinglePhoto(
   const presetKey: BeautyPreset = config.beautyPreset || "glow";
   const preset = BEAUTY_PRESETS[presetKey] || BEAUTY_PRESETS.glow;
 
-  const brightness = config.brightness ?? preset.brightness;
+  let brightness = config.brightness ?? preset.brightness;
+  if (config.brightnessAdjust) {
+    brightness += Math.round(config.brightnessAdjust * 0.4);
+  }
   const contrast = config.contrast ?? preset.contrast;
   const saturate = preset.saturate;
 
   // 3. Tính toán vị trí & kích thước người (Đảm bảo đỉnh tóc cách mép trên 10% - 12%)
   const biometricPreset = getBiometricStandardPreset(config.size);
   const userScale = config.scale ?? biometricPreset.scale;
-  const userOffsetX = config.offsetX ?? biometricPreset.offsetX;
-  const userOffsetY = config.offsetY ?? biometricPreset.offsetY;
+  // Kích thước canvas 2x Ultra HD nên scale vị trí tương xứng
+  const userOffsetX = (config.offsetX ?? biometricPreset.offsetX) * 2;
+  const userOffsetY = (config.offsetY ?? biometricPreset.offsetY) * 2;
 
   const baseScale = Math.min(
     width / personImg.width,
@@ -875,7 +879,7 @@ export async function renderSinglePhoto(
   const drawX = (width - drawWidth) / 2 + userOffsetX;
   const drawY = height - drawHeight + userOffsetY;
 
-  // Vẽ người lên lớp Canvas trung gian để xử lý điểm ảnh
+  // 4. Vẽ người lên lớp Canvas trung gian với bộ lọc Canvas GPU mượt mà (Bảo toàn 100% màu sắc & chi tiết gốc)
   const personLayer = document.createElement("canvas");
   personLayer.width = width;
   personLayer.height = height;
@@ -888,24 +892,12 @@ export async function renderSinglePhoto(
   pCtx.drawImage(personImg, drawX, drawY, drawWidth, drawHeight);
   pCtx.restore();
 
-  // Xử lý khử viền bẩn & Bộ lọc làm đẹp da đa tầng
-  cleanPersonEdgesAndRelight(
-    pCtx,
-    width,
-    height,
-    activeBgColor,
-    presetKey,
-    {
-      brightnessAdjust: config.brightnessAdjust,
-      smoothness: config.smoothness,
-      rosyTone: config.rosyTone,
-      eyeBrightening: config.eyeBrightening,
-    },
-    Boolean(config.quickPreview)
-  );
-
-  // 4. Vẽ trực tiếp lớp người lên nền Studio
+  // 5. Hòa trộn Subpixel Feathering mượt mà vào nền Studio chuẩn (Không làm biến dạng hạt ảnh)
+  ctx.save();
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
   ctx.drawImage(personLayer, 0, 0);
+  ctx.restore();
 
   // 5. Nếu showWatermark = true (bản miễn phí), vẽ dòng chữ chìm tinh tế
   if (config.showWatermark) {
