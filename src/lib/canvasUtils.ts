@@ -425,9 +425,8 @@ export function cleanPersonEdgesAndRelight(
 
   // Hệ số nâng tông da trắng hồng (0..100)
   const rosyFactor = Math.max(-0.12, Math.min(0.45, (rTone / 100) * 0.48));
-  const bgRgb = hexToRgb(bgColor === "transparent" ? "#0098ff" : bgColor);
 
-  // --- BƯỚC 4: XỬ LÝ ĐIỂM ẢNH (LÀM ĐẸP DA & PHA 25% MÀU NỀN VÀO VIỀN) ---
+  // --- BƯỚC 4: XỬ LÝ ĐIỂM ẢNH (LÀM ĐẸP DA & KHỬ RĂNG CƯA SUB-PIXEL) ---
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const pos = y * width + x;
@@ -445,7 +444,8 @@ export function cleanPersonEdgesAndRelight(
       if (y > 0 && alphaSnapshot[pos - width] === 0) emptyNeighbors++;
       if (y < height - 1 && alphaSnapshot[pos + width] === 0) emptyNeighbors++;
 
-      if (emptyNeighbors >= 3 && a < 220) {
+      // Khử nhiễu các điểm ảnh mồ côi cô lập nhưng TUYỆT ĐỐI KHÔNG ăn lẹm vào sợi tóc
+      if (emptyNeighbors === 4 && a < 60) {
         data[idx + 3] = 0;
         continue;
       }
@@ -469,14 +469,15 @@ export function cleanPersonEdgesAndRelight(
           g = gammaLUT[g];
           b = gammaLUT[b];
 
-          // 2) Highlight Roll-off chống bóng dầu
-          if (r > 225 && g > 210 && b > 195) {
-            r = Math.round(r * 0.92);
-            g = Math.round(g * 0.92);
-            b = Math.round(b * 0.92);
+          // 2) Highlight Roll-off mượt mà chống bóng dầu (không gây loang đốm vỡ màu)
+          if (r > 240 && g > 230 && b > 215) {
+            const excess = (r - 240) * 0.25;
+            r = Math.round(r - excess);
+            g = Math.round(g - excess * 0.8);
+            b = Math.round(b - excess * 0.6);
           }
 
-          // 3) Cân bằng kênh Đỏ/Xanh dương tạo làn da trắng hồng, khử ám vàng đèn phòng
+          // 3) Cân bằng kênh Đỏ/Xanh dương tạo làn da trắng hồng tự nhiên
           if (rosyFactor !== 0) {
             const rosyR = Math.min(255, r * (1 + rosyFactor * 0.35));
             const rosyG = Math.max(0, g * (1 - rosyFactor * 0.1));
@@ -507,32 +508,10 @@ export function cleanPersonEdgesAndRelight(
         }
       }
 
-      // Pha nhẹ 25% màu nền vào điểm ảnh viền (115 <= alpha < 235) để tiệp hoàn toàn vào phông nền
-      if (a >= 115 && a < 235) {
-        const normalizedEdge = (a - 115) / (235 - 115);
-        a = Math.min(255, Math.max(0, Math.round(35 + normalizedEdge * 220)));
-
-        const edgeLuma = 0.299 * r + 0.587 * g + 0.114 * b;
-        if (edgeLuma > 130) {
-          const darkenFactor = edgeLuma > 175 ? 0.74 : 0.85;
-          r = Math.round(r * darkenFactor);
-          g = Math.round(g * darkenFactor);
-          b = Math.round(b * darkenFactor);
-        }
-
-        r = Math.round(r * 0.75 + bgRgb.r * 0.25);
-        g = Math.round(g * 0.75 + bgRgb.g * 0.25);
-        b = Math.round(b * 0.75 + bgRgb.b * 0.25);
-      } else if (emptyNeighbors >= 1) {
-        const borderLuma = 0.299 * r + 0.587 * g + 0.114 * b;
-        if (borderLuma > 165) {
-          r = Math.round(r * 0.86);
-          g = Math.round(g * 0.86);
-          b = Math.round(b * 0.86);
-        }
-        r = Math.round(r * 0.85 + bgRgb.r * 0.15);
-        g = Math.round(g * 0.85 + bgRgb.g * 0.15);
-        b = Math.round(b * 0.85 + bgRgb.b * 0.15);
+      // Khử viền răng cưa mềm mại (Anti-aliasing sub-pixel) bảo toàn nguyên vẹn màu tóc gốc
+      if (a > 0 && a < 240 && emptyNeighbors >= 1) {
+        // Giữ nguyên 100% màu gốc r, g, b của sợi tóc và trang phục, chỉ làm mịn đường chuyển tiếp alpha
+        a = Math.min(255, Math.round(a * 1.05));
       }
 
       data[idx] = Math.max(0, Math.min(255, r));
