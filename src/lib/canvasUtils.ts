@@ -120,29 +120,19 @@ export interface BiometricPreset {
 
 /**
  * Tự động căn chuẩn sinh trắc học (getBiometricStandardPreset)
- * Đảm bảo đỉnh tóc luôn cách mép trên từ 10% - 12% (không bao giờ bị cụt đỉnh đầu):
- * - Cỡ '2x3' (236 x 354 px): { scale: 1.00, offsetY: 15, offsetX: 0 }
- * - Cỡ '3x4' (354 x 472 px): { scale: 1.02, offsetY: 20, offsetX: 0 }
- * - Cỡ '3.5x4.5' (413 x 531 px): { scale: 1.06, offsetY: 24, offsetX: 0 }
- * - Cỡ '4x6' (472 x 709 px): { scale: 1.16, offsetY: 34, offsetX: 0 }
- * - Cỡ 'visa' (600 x 600 px): { scale: 1.08, offsetY: 18, offsetX: 0 }
+ * Đảm bảo thông số khởi đầu chuẩn cho thuật toán Auto-Framing theo Bounding Box (Đỉnh tóc ở vạch 8.5% / 5mm)
  */
 export function getBiometricStandardPreset(
   size: PhotoSizeKey
 ): BiometricPreset {
   switch (size) {
     case "2x3":
-      return { scale: 1.0, offsetY: 15, offsetX: 0, safeMarginTopRatio: 0.1 };
     case "3x4":
-      return { scale: 1.02, offsetY: 20, offsetX: 0, safeMarginTopRatio: 0.1 };
     case "3.5x4.5":
-      return { scale: 1.06, offsetY: 24, offsetX: 0, safeMarginTopRatio: 0.11 };
     case "4x6":
-      return { scale: 1.16, offsetY: 34, offsetX: 0, safeMarginTopRatio: 0.12 };
     case "visa":
-      return { scale: 1.08, offsetY: 18, offsetX: 0, safeMarginTopRatio: 0.11 };
     default:
-      return { scale: 1.16, offsetY: 34, offsetX: 0, safeMarginTopRatio: 0.12 };
+      return { scale: 1.0, offsetY: 0, offsetX: 0, safeMarginTopRatio: 0.085 };
   }
 }
 
@@ -822,8 +812,226 @@ function fillStudioBackdrop(
   ctx.fillRect(0, 0, width, height);
 }
 
+const refinedMaskCache = new WeakMap<
+  HTMLImageElement | HTMLCanvasElement,
+  HTMLCanvasElement
+>();
+
+export interface HeadAndBodyBounds {
+  topY: number;
+  bottomY: number;
+  headLeftX: number;
+  headRightX: number;
+  headCenterX: number;
+  headWidth: number;
+}
+
+const boundsCache = new WeakMap<HTMLCanvasElement, HeadAndBodyBounds>();
+
 /**
- * Vẽ 1 ảnh thẻ hoàn chỉnh lên Canvas chuẩn 300 DPI
+ * Thuật toán "Co Viền 3px & Khử Răng Cưa Mặt Nạ" (Alpha Choke, Edge Color Decontamination & Feathering):
+ * 1. Bước A (Alpha Choke & Erosion):
+ *    - Mọi pixel có alpha < 185 (vùng viền lem nhem chứa màu tường vàng quanh tai và ghế đen quanh cổ): Gán thẳng alpha = 0.
+ *    - Với các pixel từ 185 <= alpha <= 250: Nội suy tuyến tính newAlpha = Math.round(((alpha - 185) / (250 - 185)) * 255) để thu hẹp viền vào trong 2-3px.
+ *    - Khử màu viền phản chiếu (Edge Color Decontamination): Với các pixel nằm sát biên (0 < newAlpha < 240), giảm nhẹ độ chói nếu pixel bị ám màu vàng/trắng sáng (R > 180 && G > 160).
+ * 2. Bước B (Feathering Anti-Aliasing):
+ *    - Tạo maskCanvas chứa kênh Alpha đã co viền, áp dụng maskCtx.filter = 'blur(1.8px)' để làm mềm hoàn toàn đường viền bậc thang.
+ *    - Dùng ctx.globalCompositeOperation = 'destination-in' áp mặt nạ mượt này lên ảnh gốc.
+ */
+export function refineCutoutMask(
+  personImg: HTMLImageElement | HTMLCanvasElement
+): HTMLCanvasElement {
+  const cached = refinedMaskCache.get(personImg);
+  if (cached) {
+    return cached;
+  }
+
+  const w = personImg.width;
+  const h = personImg.height;
+
+  const tempCanvas = document.createElement("canvas");
+  tempCanvas.width = w;
+  tempCanvas.height = h;
+  const ctx = tempCanvas.getContext("2d")!;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(personImg, 0, 0, w, h);
+
+  const imageData = ctx.getImageData(0, 0, w, h);
+  const data = imageData.data;
+
+  const chokedMaskCanvas = document.createElement("canvas");
+  chokedMaskCanvas.width = w;
+  chokedMaskCanvas.height = h;
+  const chokedCtx = chokedMaskCanvas.getContext("2d")!;
+  const maskImageData = chokedCtx.createImageData(w, h);
+  const maskData = maskImageData.data;
+
+  // Bước A - Co viền mặt nạ (Alpha Choke & Erosion) + Khử màu viền phản chiếu (Edge Color Decontamination)
+  for (let i = 0; i < data.length; i += 4) {
+    const alpha = data[i + 3];
+    let newAlpha = 0;
+
+    if (alpha < 185) {
+      newAlpha = 0;
+    } else if (alpha <= 250) {
+      newAlpha = Math.round(((alpha - 185) / (250 - 185)) * 255);
+    } else {
+      newAlpha = 255;
+    }
+
+    // Khử màu viền phản chiếu (Edge Color Decontamination) cho pixel nằm sát biên
+    if (newAlpha > 0 && newAlpha < 240) {
+      const r = data[i];
+      const g = data[i + 1];
+      const b = data[i + 2];
+      if (r > 180 && g > 160) {
+        data[i] = Math.round(r * 0.72);
+        data[i + 1] = Math.round(g * 0.72);
+        data[i + 2] = Math.round(b * 0.78);
+      }
+    }
+
+    // Giữ ảnh gốc có độ phủ pełne ở vùng có mặt nạ để bước destination-in quyết định độ mượt biên
+    data[i + 3] = newAlpha > 0 ? 255 : 0;
+
+    maskData[i] = 0;
+    maskData[i + 1] = 0;
+    maskData[i + 2] = 0;
+    maskData[i + 3] = newAlpha;
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+  chokedCtx.putImageData(maskImageData, 0, 0);
+
+  // Bước B - Làm mềm biên chống răng cưa (Feathering Anti-Aliasing)
+  const maskCanvas = document.createElement("canvas");
+  maskCanvas.width = w;
+  maskCanvas.height = h;
+  const maskCtx = maskCanvas.getContext("2d")!;
+  maskCtx.imageSmoothingEnabled = true;
+  maskCtx.imageSmoothingQuality = "high";
+  maskCtx.filter = "blur(1.8px)";
+  maskCtx.drawImage(chokedMaskCanvas, 0, 0);
+
+  ctx.save();
+  ctx.globalCompositeOperation = "destination-in";
+  ctx.drawImage(maskCanvas, 0, 0);
+  ctx.restore();
+
+  refinedMaskCache.set(personImg, tempCanvas);
+  return tempCanvas;
+}
+
+/**
+ * Thuật toán Tự Động Đo Đỉnh Tóc & Bề Rộng Đầu (detectHeadAndBodyBounds):
+ * - Quét tìm topY: Hàng pixel đầu tiên từ trên xuống có alpha > 100 (Đỉnh tóc).
+ * - Quét vùng phần đầu (từ topY xuống khoảng topY + 35% chiều cao người) để tìm headLeftX và headRightX.
+ * - Tính headCenterX = (headLeftX + headRightX) / 2 và headWidth = headRightX - headLeftX.
+ */
+export function detectHeadAndBodyBounds(
+  cleanCanvas: HTMLCanvasElement
+): HeadAndBodyBounds {
+  const cached = boundsCache.get(cleanCanvas);
+  if (cached) {
+    return cached;
+  }
+
+  const w = cleanCanvas.width;
+  const h = cleanCanvas.height;
+  const ctx = cleanCanvas.getContext("2d")!;
+  const data = ctx.getImageData(0, 0, w, h).data;
+
+  let topY = -1;
+  let bottomY = -1;
+
+  // Quét tìm topY (hàng đầu tiên từ trên xuống có alpha > 100)
+  for (let y = 0; y < h; y++) {
+    let rowHasPixel = false;
+    const rowOffset = y * w * 4;
+    for (let x = 0; x < w; x++) {
+      if (data[rowOffset + x * 4 + 3] > 100) {
+        rowHasPixel = true;
+        break;
+      }
+    }
+    if (rowHasPixel) {
+      topY = y;
+      break;
+    }
+  }
+
+  // Quét tìm bottomY từ dưới lên để xác định chiều cao người trong ảnh
+  for (let y = h - 1; y >= 0; y--) {
+    let rowHasPixel = false;
+    const rowOffset = y * w * 4;
+    for (let x = 0; x < w; x++) {
+      if (data[rowOffset + x * 4 + 3] > 100) {
+        rowHasPixel = true;
+        break;
+      }
+    }
+    if (rowHasPixel) {
+      bottomY = y;
+      break;
+    }
+  }
+
+  if (topY === -1 || bottomY === -1 || bottomY <= topY) {
+    const fallbackBounds: HeadAndBodyBounds = {
+      topY: Math.round(h * 0.085),
+      bottomY: h - 1,
+      headLeftX: Math.round(w * 0.25),
+      headRightX: Math.round(w * 0.75),
+      headCenterX: w / 2,
+      headWidth: w * 0.5,
+    };
+    boundsCache.set(cleanCanvas, fallbackBounds);
+    return fallbackBounds;
+  }
+
+  const personHeight = Math.max(1, bottomY - topY);
+  const headScanEndY = Math.min(
+    bottomY,
+    Math.round(topY + personHeight * 0.35)
+  );
+
+  let headLeftX = w;
+  let headRightX = 0;
+
+  for (let y = topY; y <= headScanEndY; y++) {
+    const rowOffset = y * w * 4;
+    for (let x = 0; x < w; x++) {
+      if (data[rowOffset + x * 4 + 3] > 100) {
+        if (x < headLeftX) headLeftX = x;
+        if (x > headRightX) headRightX = x;
+      }
+    }
+  }
+
+  if (headRightX <= headLeftX) {
+    headLeftX = Math.round(w * 0.25);
+    headRightX = Math.round(w * 0.75);
+  }
+
+  const headCenterX = (headLeftX + headRightX) / 2;
+  const headWidth = headRightX - headLeftX;
+
+  const bounds: HeadAndBodyBounds = {
+    topY,
+    bottomY,
+    headLeftX,
+    headRightX,
+    headCenterX,
+    headWidth,
+  };
+
+  boundsCache.set(cleanCanvas, bounds);
+  return bounds;
+}
+
+/**
+ * Vẽ 1 ảnh thẻ hoàn chỉnh lên Canvas chuẩn 300 DPI (2x Retina Ultra HD)
  */
 export async function renderSinglePhoto(
   canvas: HTMLCanvasElement,
@@ -860,24 +1068,28 @@ export async function renderSinglePhoto(
   const contrast = config.contrast ?? preset.contrast;
   const saturate = preset.saturate;
 
-  // 3. Tính toán vị trí & kích thước người (Đảm bảo đỉnh tóc cách mép trên 10% - 12%)
+  // 3. Tinh chỉnh mặt nạ (Co viền 3px & Khử răng cưa) và Tự động đo Đỉnh tóc / Bề rộng đầu
+  const cleanCanvas = refineCutoutMask(personImg);
+  const { topY, headCenterX, headWidth } = detectHeadAndBodyBounds(cleanCanvas);
+
   const biometricPreset = getBiometricStandardPreset(config.size);
   const userScale = config.scale ?? biometricPreset.scale;
-  // Kích thước canvas 2x Ultra HD nên scale vị trí tương xứng
-  const userOffsetX = (config.offsetX ?? biometricPreset.offsetX) * 2;
-  const userOffsetY = (config.offsetY ?? biometricPreset.offsetY) * 2;
+  const userOffsetX = config.offsetX ?? biometricPreset.offsetX;
+  const userOffsetY = config.offsetY ?? biometricPreset.offsetY;
 
-  const baseScale = Math.min(
-    width / personImg.width,
-    (height * 0.78) / personImg.height
-  );
+  // Tự động Phóng to (Auto-Zoom) để bề rộng đầu chiếm ~52% khung ảnh và Đỉnh tóc nằm đúng vạch 5mm (8.5%)
+  const baseScale =
+    (canvas.width * 0.52) / Math.max(headWidth, cleanCanvas.width * 0.22);
   const finalScale = baseScale * userScale;
+  const drawWidth = cleanCanvas.width * finalScale;
+  const drawHeight = cleanCanvas.height * finalScale;
 
-  const drawWidth = personImg.width * finalScale;
-  const drawHeight = personImg.height * finalScale;
-
-  const drawX = (width - drawWidth) / 2 + userOffsetX;
-  const drawY = height - drawHeight + userOffsetY;
+  // Căn tâm đầu vào giữa khung ảnh + offsetX của người dùng
+  const drawX =
+    canvas.width / 2 - headCenterX * finalScale + userOffsetX * 2;
+  // Đặt đỉnh tóc (topY) nằm đúng ở vạch 8.5% từ mép trên (5mm) + offsetY của người dùng
+  const drawY =
+    canvas.height * 0.085 - topY * finalScale + userOffsetY * 2;
 
   // 4. Vẽ người lên lớp Canvas trung gian với bộ lọc Canvas GPU mượt mà (Bảo toàn 100% màu sắc & chi tiết gốc)
   const personLayer = document.createElement("canvas");
@@ -889,7 +1101,7 @@ export async function renderSinglePhoto(
 
   pCtx.save();
   pCtx.filter = `brightness(${brightness}%) contrast(${contrast}%) saturate(${saturate}%)`;
-  pCtx.drawImage(personImg, drawX, drawY, drawWidth, drawHeight);
+  pCtx.drawImage(cleanCanvas, drawX, drawY, drawWidth, drawHeight);
   pCtx.restore();
 
   // 5. Hòa trộn Subpixel Feathering mượt mà vào nền Studio chuẩn (Không làm biến dạng hạt ảnh)

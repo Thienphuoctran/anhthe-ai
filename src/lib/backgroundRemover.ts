@@ -1,10 +1,8 @@
 /**
  * Hệ thống Tách Nền Ảnh Thẻ AI Studio Chuẩn Sinh Trắc Học & Giữ Nguyên Độ Phân Giải Gốc:
- * 1. Tầng 1 (Chính): Tách nền 4K bằng AI Agent (BRIA RMBG-2.0 / Replicate) qua endpoint `/api/ai-cutout`.
- *    - Xóa sạch 100% chiếc ghế đen phía sau lưng, tạp vật và phông nền lộn xộn.
- *    - Giữ trọn vẹn bờ vai áo và từng sợi tóc tơ sắc nét.
- * 2. Tầng 2 (Dự phòng Client): @imgly/background-removal với mô hình 'isnet_quint8' tăng tốc phần cứng WebGL.
- * 3. Tầng 3 (Dự phòng khẩn cấp): Google MediaPipe Portrait Segmentation (modelSelection: 0).
+ * 1. BẮT BUỘC ƯU TIÊN TẦNG 1: Gọi AI Replicate 4K qua `POST /api/ai-cutout` (tối đa 1600px để gửi nhanh, giữ độ nét cao).
+ * 2. TẦNG 2 (Fallback khi mất mạng/API lỗi): @imgly/background-removal trên trình duyệt.
+ * 3. TẦNG 3 (Dự phòng khẩn cấp): Google MediaPipe Portrait Segmentation (modelSelection: 0).
  * 4. Kỹ thuật High-Res Alpha Masking: Ghép mặt nạ AI ngược trở lại tấm ảnh gốc độ phân giải cao bằng
  *    phép hòa trộn Destination-In chuẩn Studio, bảo toàn 100% độ nét, màu sắc và chi tiết camera.
  */
@@ -12,9 +10,14 @@
 /**
  * Tải file/blob/url thành đối tượng HTMLImageElement với đầy đủ thông số kích thước thực.
  */
-export function blobToImage(blobOrUrl: Blob | File | string): Promise<HTMLImageElement> {
+export function blobToImage(
+  blobOrUrl: Blob | File | string
+): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
-    const url = typeof blobOrUrl === "string" ? blobOrUrl : URL.createObjectURL(blobOrUrl);
+    const url =
+      typeof blobOrUrl === "string"
+        ? blobOrUrl
+        : URL.createObjectURL(blobOrUrl);
     const img = new Image();
     img.crossOrigin = "anonymous";
     img.onload = () => {
@@ -34,17 +37,19 @@ export function blobToImage(blobOrUrl: Blob | File | string): Promise<HTMLImageE
 }
 
 /**
- * Chuyển đổi File/Blob sang chuỗi Base64 tối ưu để gửi lên API tách nền Replicate 4K
- * (Đảm bảo dung lượng < 3MB để an toàn với giới hạn tải trọng Vercel 4.5MB)
+ * Chuyển đổi File/Blob sang chuỗi Base64 (giữ độ phân giải cao, tối đa 1600px để gửi nhanh)
+ * phục vụ gọi POST /api/ai-cutout.
  */
-async function fileToApiBase64(file: File | Blob): Promise<string> {
+async function fileToApiBase64(
+  file: File | Blob,
+  maxDimension: number = 1600
+): Promise<string> {
   const img = await blobToImage(file);
   const w = img.naturalWidth || img.width;
   const h = img.naturalHeight || img.height;
   const maxD = Math.max(w, h);
 
-  // Nếu ảnh đã dưới 2MB và <= 2200px -> Đọc trực tiếp Base64
-  if (file.size <= 2 * 1024 * 1024 && maxD <= 2200) {
+  if (file.size <= 1.8 * 1024 * 1024 && maxD <= maxDimension) {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result as string);
@@ -53,8 +58,7 @@ async function fileToApiBase64(file: File | Blob): Promise<string> {
     });
   }
 
-  // Nếu ảnh quá lớn (ảnh camera 48MP/12MP), co nhẹ về 2200px JPEG quality 0.95
-  const scale = maxD > 2200 ? 2200 / maxD : 1;
+  const scale = maxD > maxDimension ? maxDimension / maxD : 1;
   const canvas = document.createElement("canvas");
   canvas.width = Math.round(w * scale);
   canvas.height = Math.round(h * scale);
@@ -64,15 +68,15 @@ async function fileToApiBase64(file: File | Blob): Promise<string> {
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
   ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-  return canvas.toDataURL("image/jpeg", 0.95);
+  return canvas.toDataURL("image/jpeg", 0.94);
 }
 
 /**
- * Tạo bản sao proxy tối ưu cho AI nhận diện tách nền Client (tối đa 2000px để bảo vệ RAM trình duyệt)
+ * Tạo bản sao proxy tối ưu cho AI nhận diện tách nền Client (tối đa 1600px để bảo vệ RAM trình duyệt)
  */
 export async function createAiSegmentationProxy(
   img: HTMLImageElement,
-  maxDimension: number = 2000
+  maxDimension: number = 1600
 ): Promise<Blob> {
   const width = img.naturalWidth || img.width;
   const height = img.naturalHeight || img.height;
@@ -164,7 +168,9 @@ async function segmentWithMediaPipePortrait(
       script.crossOrigin = "anonymous";
       script.onload = () => resolve();
       script.onerror = () =>
-        reject(new Error("Không thể tải thư viện MediaPipe Selfie Segmentation."));
+        reject(
+          new Error("Không thể tải thư viện MediaPipe Selfie Segmentation.")
+        );
       document.head.appendChild(script);
     });
   }
@@ -261,10 +267,9 @@ async function segmentWithMediaPipePortrait(
 
 /**
  * Hàm Tách Nền Ảnh Thẻ Toàn Diện:
- * - Tầng 1: Replicate RMBG-2.0 / lucataco xóa sạch 100% ghế đen phía sau lưng, giữ chi tiết bờ vai & tóc 4K.
- * - Tầng 2: Fallback Client @imgly/background-removal (isnet_quint8) mượt mà.
- * - Tầng 3: Fallback MediaPipe Portrait AI.
- * - BƯỚC CUỐI: Ghép mặt nạ Alpha vào ảnh gốc camera (Full Resolution), giữ 100% độ sắc nét nguyên bản!
+ * 1. BẮT BUỘC ưu tiên gọi POST /api/ai-cutout (Replicate 4K) với ảnh Base64 tối đa 1600px.
+ * 2. Chỉ khi /api/ai-cutout báo lỗi mạng mới chạy fallback sang @imgly/background-removal ở trình duyệt.
+ * 3. Ghép mặt nạ Alpha vào ảnh gốc camera (Full Resolution), giữ 100% độ sắc nét nguyên bản.
  */
 export async function removePhotoBackground(
   file: File | Blob,
@@ -285,12 +290,11 @@ export async function removePhotoBackground(
 
   let cutoutResultBlob: Blob | null = null;
 
-  // 2. TẦNG 1: TÁCH NỀN 4K CHUYÊN NGHIỆP QUA REPLICATE RMBG-2.0 (/api/ai-cutout)
-  // Xóa sạch 100% ghế đen, phòng ngủ, tạp vật phía sau, giữ trọn vẹn bờ vai và từng sợi tóc tơ
+  // 2. BẮT BUỘC ƯU TIÊN TẦNG 1: GỌI AI REPLICATE 4K QUA POST /api/ai-cutout
   try {
     onProgress?.(15);
-    const base64Data = await fileToApiBase64(file);
-    onProgress?.(30);
+    const base64Data = await fileToApiBase64(file, 1600);
+    onProgress?.(35);
 
     const apiRes = await fetch("/api/ai-cutout", {
       method: "POST",
@@ -298,38 +302,35 @@ export async function removePhotoBackground(
       body: JSON.stringify({ imageBase64: base64Data }),
     });
 
-    if (apiRes.ok) {
-      const json = await apiRes.json();
-      if (json.success && json.cutoutImageUrl) {
-        onProgress?.(80);
-        const resFetch = await fetch(json.cutoutImageUrl);
-        if (resFetch.ok) {
-          cutoutResultBlob = await resFetch.blob();
-        }
+    if (!apiRes.ok) {
+      throw new Error(`API /api/ai-cutout trả về mã lỗi ${apiRes.status}`);
+    }
+
+    const json = await apiRes.json();
+    if (json.success && json.cutoutImageUrl) {
+      onProgress?.(82);
+      const resFetch = await fetch(json.cutoutImageUrl);
+      if (resFetch.ok) {
+        cutoutResultBlob = await resFetch.blob();
       }
     }
   } catch (apiErr) {
     console.warn(
-      "Tầng 1 (Replicate Cloud) không khả dụng, chuyển sang Tầng 2 (Client WASM):",
+      "API /api/ai-cutout gặp lỗi mạng, chuyển sang fallback @imgly/background-removal ở trình duyệt:",
       apiErr
     );
   }
 
-  // 3. TẦNG 2: NẾU TẦNG 1 CHƯA CÓ KẾT QUẢ -> DÙNG CLIENT-SIDE @imgly/background-removal
+  // 3. TẦNG 2 (FALLBACK KHI LỖI MẠNG): DÙNG @imgly/background-removal Ở TRÌNH DUYỆT
   if (!cutoutResultBlob) {
-    const aiProxyBlob = await createAiSegmentationProxy(originalImg, 2000);
+    const aiProxyBlob = await createAiSegmentationProxy(originalImg, 1600);
     onProgress?.(45);
-
-    const isMobile =
-      typeof navigator !== "undefined" &&
-      /iPhone|iPad|iPod|Android|Mobile/i.test(navigator.userAgent);
 
     try {
       const { removeBackground } = await import("@imgly/background-removal");
-      const selectedModel = isMobile ? "isnet_quint8" : "isnet_quint8";
 
       cutoutResultBlob = await removeBackground(aiProxyBlob, {
-        model: selectedModel,
+        model: "isnet_quint8",
         device: "gpu",
         output: {
           format: "image/png",
@@ -370,7 +371,6 @@ export async function removePhotoBackground(
           imglyCpuError
         );
 
-        // 4. TẦNG 3: Fallback MediaPipe Portrait AI
         try {
           cutoutResultBlob = await segmentWithMediaPipePortrait(
             originalImg,
@@ -388,7 +388,7 @@ export async function removePhotoBackground(
 
   onProgress?.(92);
 
-  // 5. BƯỚC QUAN TRỌNG NHẤT: HIGH-RES ALPHA MASKING
+  // 4. BƯỚC QUAN TRỌNG: HIGH-RES ALPHA MASKING
   // Ghép mặt nạ AI vào ảnh gốc camera (Full Resolution), giữ 100% độ sắc nét tuyệt đối của camera!
   try {
     const cutoutImg = await blobToImage(cutoutResultBlob!);
@@ -405,10 +405,10 @@ export async function removePhotoBackground(
     mCtx.imageSmoothingEnabled = true;
     mCtx.imageSmoothingQuality = "high";
 
-    // Bước 5.1: Vẽ ảnh gốc nguyên bản 100% điểm ảnh sắc nét lên canvas
+    // Bước 4.1: Vẽ ảnh gốc nguyên bản 100% điểm ảnh sắc nét lên canvas
     mCtx.drawImage(originalImg, 0, 0, origW, origH);
 
-    // Bước 5.2: Phép hòa trộn destination-in dùng mặt nạ AI để loại bỏ nền nhưng giữ nguyên mọi chi tiết gốc
+    // Bước 4.2: Phép hòa trộn destination-in dùng mặt nạ AI để loại bỏ nền nhưng giữ nguyên mọi chi tiết gốc
     mCtx.globalCompositeOperation = "destination-in";
     mCtx.drawImage(cutoutImg, 0, 0, origW, origH);
 
